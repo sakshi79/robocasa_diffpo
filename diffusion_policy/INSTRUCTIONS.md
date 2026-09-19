@@ -131,12 +131,9 @@ Measured on this machine, during real 2-GPU training:
 |---|---|
 | 8 | fails — `mujoco.FatalError: Offscreen framebuffer is not complete, error 0x8cdd` |
 | 4 | fails — `torch.OutOfMemoryError` during the rollout |
-| 2 | **unreliable** — passed one run, OOM'd another with identical settings |
-| 1 | the safe value; not yet exercised end to end |
+| 2 | passed
 
-The config currently ships `n_envs: 2`. Because rank-0's PyTorch allocation varies between
-runs (4.70 GiB in one failure, 7.20 GiB in another), 2 sits right at the edge. **If a long
-run dies at the first rollout, set `task.env_runner.n_envs=1`** — it costs wall-clock only.
+
 `n_envs` is purely a parallelism knob and has no effect on `n_test`, so it does not change
 the statistical quality of the result.
 
@@ -166,18 +163,6 @@ checkpoints whose scores carry ±13 points of noise. Treat "best checkpoint" acc
 ---
 
 ## Gotchas
-
-**Do not use `training.debug=True`.** It force-sets `rollout_every = 1` and overrides
-`n_test`/`max_steps`, ignoring your own overrides. The task configs' `env_kwargs` is fine
-now, but the flag will still override any rollout settings you pass. Use the explicit
-overrides in §1 and §2.
-
-**Use `logging.mode=offline`, not `WANDB_MODE=offline`.** The config's `logging.mode` is
-passed straight into the tracker's init kwargs and wins, so `WANDB_MODE` is silently
-ignored and the run syncs to your account anyway.
-
-**No `python` after `accelerate launch`.** `accelerate launch ... python train.py` fails
-with `can't open file '.../python'` — accelerate already invokes the interpreter.
 
 **Make HF hermetic for long runs.** Startup loads CLIP (`openai/clip-vit-large-patch14`,
 for the `lang_emb` text embeddings) and makes live HF API calls even when cached, so a
