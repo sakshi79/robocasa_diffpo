@@ -1,0 +1,46 @@
+# Workspace root for the combined robocasa stack. diffusion_policy/, robocasa/,
+# robomimic/ and robosuite/ are vendored here and tracked by this repo.
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments, editors, OS
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# Demonstration datasets, fetched by robocasa/robocasa/scripts/download_datasets.py
+robocasa/datasets/
+
+# Kitchen assets (~23G), fetched by robocasa/robocasa/scripts/download_kitchen_assets.py.
+# objects/ holds only these three downloaded packs plus a README.
+robocasa/robocasa/models/assets/objects/aigen_objs/
+robocasa/robocasa/models/assets/objects/objaverse/
+robocasa/robocasa/models/assets/objects/lightwheel/
+robocasa/robocasa/models/assets/textures/
+robocasa/robocasa/models/assets/generative_textures/
+
+# The fixtures pack extracts into fixtures/ as numbered model directories
+# (Refrigerator031/, CabinetDoorPanel001/, ...), interleaved with hand-written
+# XML that ships with the source. Ignore the numbered dirs, keep the rest.
+robocasa/robocasa/models/assets/fixtures/**/*[0-9][0-9][0-9]/
+
+# Training runs: checkpoints, rollout videos, hydra output (~27G)
+diffusion_policy/data/
+diffusion_policy/wandb/
+
+# Logs and simulator scratch files
+*.log
+nohup.out
+MUJOCO_LOG.TXT

@@ -1,0 +1,35 @@
+# Environment for running RoboCasa365 experiments with this fork.
+#
+# This replaces the original Diffusion Policy environment (python 3.9 /
+# pytorch 1.12 / numpy 1.23 / diffusers 0.11), which cannot be installed
+# alongside robocasa 1.0.1 and lerobot 0.3.3. See ENVIRONMENT.md for the
+# details of the conflict.
+#
+# Usage:
+#   conda env create -f conda_environment.yaml
+#   conda activate robocasa
+#   pip install -e .
+#   pip install --no-deps -e ../robomimic     # --no-deps is required
+#   pip install -e ../robosuite -e ../robocasa
+name: robocasa
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # torchcodec loads FFmpeg via shared libraries and does not vendor them.
+  # Without this, `import torchcodec` fails with "Could not load libtorchcodec".
+  - ffmpeg=7
+  # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625
+  - llvm-openmp=14
+  - pip:
+    # Install the CUDA 12.6 torch build explicitly. The default PyPI wheel
+    # works too, but must match the torchcodec version below:
+    #   torchcodec 0.4.x <-> torch 2.7.x
+    - --extra-index-url https://download.pytorch.org/whl/cu126
+    - torch==2.7.1
+    - torchvision==0.22.1
+    - torchcodec==0.4.0
+
+    # this repo (also pulls in the dependency set declared in setup.py)
+    - -e .
