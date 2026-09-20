@@ -1,6 +1,6 @@
 # Running training and evaluation
 
-*Last updated: 2026-09-17. Verified on 2× RTX 4070 Ti (12 GB each), 24 cores, 62 GB RAM.*
+*Last updated: 2026-09-20. Verified on 2× RTX 4070 Ti (12 GB each), 24 cores, 62 GB RAM.*
 
 Setup and dependency background: [ENVIRONMENT.md](ENVIRONMENT.md).
 What was changed in the source and why: [CODE_FIXES.md](CODE_FIXES.md).
@@ -80,7 +80,7 @@ This picks up:
 
 | setting | value | note |
 |---|---|---|
-| `dataloader.batch_size` | 32 | **global**, split across GPUs → 16/GPU |
+| `dataloader.batch_size` | 32 | **global**, split across GPUs → 16/GPU. Only true while the `DataLoaderConfiguration` fix is in place — see Gotchas |
 | `gradient_accumulate_every` | 6 | 32 × 6 = 192 effective, which the lr was tuned for |
 | `num_epochs` / `max_train_steps` | 1000 / 500 | 500 steps per epoch |
 | `rollout_every` | 50 | 20 rollout events over the run |
@@ -131,8 +131,12 @@ Measured on this machine, during real 2-GPU training:
 |---|---|
 | 8 | fails — `mujoco.FatalError: Offscreen framebuffer is not complete, error 0x8cdd` |
 | 4 | fails — `torch.OutOfMemoryError` during the rollout |
-| 2 | passed
+| 2 | passed — 8 consecutive rollout events over a 2-day run, peak 11721 / 12282 MiB |
 
+
+These numbers predate the `split_batches` fix, when each GPU held a batch of 32. Per-GPU
+activation memory is now halved (16/GPU), so there should be more headroom than the
+~560 MiB measured above — not yet re-measured.
 
 `n_envs` is purely a parallelism knob and has no effect on `n_test`, so it does not change
 the statistical quality of the result.
@@ -163,6 +167,32 @@ checkpoints whose scores carry ±13 points of noise. Treat "best checkpoint" acc
 ---
 
 ## Gotchas
+
+**Never pass `split_batches=True` as a bare `Accelerator` kwarg.** accelerate ≥1.x
+ignores it silently — no warning, `accelerator.split_batches` just stays `False`. It must
+go through `dataloader_config=DataLoaderConfiguration(split_batches=True)`. When it is
+wrong, two things break at once and neither raises: `batch_size` becomes per-process
+(doubling the effective batch), and the LR scheduler advances `num_processes` times per
+step, so the cosine finishes at **half** the run and then climbs back toward peak instead
+of annealing. Sanity check after any change to the `Accelerator` construction:
+
+```bash
+python -c "
+from accelerate import Accelerator
+from accelerate.utils import DataLoaderConfiguration
+print(Accelerator(dataloader_config=DataLoaderConfiguration(split_batches=True)).split_batches)"
+# must print True
+```
+
+A quick empirical check on any run: the LR should advance one scheduler step per
+`gradient_accumulate_every` global steps. With `accum: 6`, `lr` should reach 6e-7 around
+global_step 36 during warmup. If it gets there twice as fast, `split_batches` is off.
+
+**Resuming is only safe with the `last_epoch` fix.** `last_epoch` counts scheduler steps,
+not `global_step`. Without the fix a resumed run lands `accum`× too far along the cosine,
+past its end, where the LR climbs instead of decaying — this cost a real run ~100 epochs
+of recovery (success 0.300 → 0.120). Verify after any resume that `lr` in
+`logs.json.txt` continues smoothly from where it left off rather than jumping.
 
 **Make HF hermetic for long runs.** Startup loads CLIP (`openai/clip-vit-large-patch14`,
 for the `lang_emb` text embeddings) and makes live HF API calls even when cached, so a

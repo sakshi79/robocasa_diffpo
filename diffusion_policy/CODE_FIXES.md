@@ -1,6 +1,6 @@
 # Code fixes: making the RoboCasa365 train and rollout paths run
 
-*Last updated: 2026-09-17*
+*Last updated: 2026-09-20*
 
 Companion to [ENVIRONMENT.md](ENVIRONMENT.md). That document covers the dependency
 conflict between the sibling repos and how the environment was rebuilt. This one covers
@@ -12,6 +12,10 @@ The failures surfaced one at a time because each one is hit at a different point
 run — import, optimizer construction, dataset build, epoch 1, rollout reset.
 
 Files touched in this repo: 15. Plus one file in the sibling `robomimic` repo.
+
+The two most consequential entries are **7** and **8** — both silent, both affecting
+training dynamics rather than raising an error. Read those first if you are auditing a
+run's hyperparameters.
 
 ---
 
@@ -209,6 +213,75 @@ episode would have been silently truncated 150 steps early. Now 750. **This must
 in sync with `env_kwargs.env_name`** — `eval_robocasa.py` sets it per task, the training
 config cannot.
 
+## 7. `split_batches=True` was silently ignored by accelerate
+
+**File:** [diffusion_policy/workspace/train_diffusion_transformer_hybrid_workspace.py](diffusion_policy/workspace/train_diffusion_transformer_hybrid_workspace.py)
+
+The single highest-impact bug found, and the hardest to see: it is silent, and it
+corrupts both the batch size and the LR schedule at once.
+
+The workspace built `Accelerator(..., split_batches=True)`. In accelerate ≥1.x that bare
+kwarg is **superseded by `DataLoaderConfiguration` and ignored without any warning** —
+the parameter is still accepted, so nothing complains:
+
+```python
+acc = Accelerator(split_batches=True)
+acc.split_batches      # -> False        (accelerate 1.15.0)
+```
+
+Two consequences, both invisible in the logs:
+
+1. **Effective batch was double the intended value.** With `split_batches=False`,
+   `dataloader.batch_size` is per-process, so `batch_size: 32` on 2 GPUs meant 64 per
+   micro-batch → `× gradient_accumulate_every: 6` = **384 effective, not 192**, against
+   a `learning_rate: 1e-4` tuned for 192.
+
+2. **The cosine LR schedule ran at double speed.** `AcceleratedScheduler.step()` advances
+   the underlying scheduler `num_processes` times per call when `split_batches` is false.
+   The scheduler therefore consumed 166,666 steps over a run calibrated to
+   `num_training_steps = 83,333`. Measured directly from the logs:
+   `global_step / scheduler_step = 3.00` where the code assumes 6.
+
+   The LR reaches 0 at **epoch ~500 of 1000**, after which `progress > 1` and
+   `cos(π·progress)` turns back upward — the LR climbs toward peak instead of annealing.
+
+The fix is to pass it the way accelerate now requires:
+
+```python
+from accelerate.utils import DataLoaderConfiguration
+accelerator = Accelerator(
+    log_with='wandb',
+    kwargs_handlers=[ddp_kwargs, timeout_handler],
+    dataloader_config=DataLoaderConfiguration(split_batches=True),
+)
+```
+
+Verified after the change: `acc.split_batches` and `AcceleratedScheduler.split_batches`
+are both `True`, and the observed rate becomes one scheduler step per 6 global steps.
+
+**Do not "simplify" this back to the bare kwarg.** It will appear to work and silently
+double your batch size and halve your LR schedule length.
+
+## 8. `last_epoch` was in the wrong units, breaking resume
+
+**File:** [diffusion_policy/workspace/train_diffusion_transformer_hybrid_workspace.py](diffusion_policy/workspace/train_diffusion_transformer_hybrid_workspace.py)
+
+`get_scheduler(..., last_epoch=self.global_step-1)` — but `last_epoch` counts *scheduler*
+steps, and the scheduler is stepped once per optimizer step, i.e. once every
+`gradient_accumulate_every` batches. Passing `global_step` directly places a resumed run
+`accum`× too far along the cosine.
+
+This is latent on a fresh run, where `global_step == 0` gives the correct `-1`. It only
+fires on the first resume — which is exactly when it happened here: a run resumed at
+epoch 300 jumped from LR 3.5e-5 back to 9.2e-5 and began *rising*, because it landed past
+the end of the schedule in the wrapped region. Task success fell 0.300 → 0.120 and took
+~100 epochs to recover to 0.280.
+
+Now `last_epoch=(self.global_step // cfg.training.gradient_accumulate_every) - 1`.
+
+Note the same line exists in the seven other `train_*_workspace.py` files and is still
+wrong there; only the transformer hybrid workspace is used by RoboCasa365.
+
 ---
 
 ## Things that are not bugs
@@ -221,9 +294,8 @@ Worth recording so they are not "fixed" later:
   validation block in the workspace is commented out upstream. `val_loss` is never
   logged. The val dataloader is still built and `accelerator.prepare`d, so its workers
   spawn and do nothing.
-- **`dataloader.batch_size` is the *global* batch**, not per-GPU: the workspace builds
-  `Accelerator(..., split_batches=True)`. With `num_processes=2`, `batch_size: 32` is
-  16 per GPU.
+- **`dataloader.batch_size` is the *global* batch**, not per-GPU — but only because of
+  fix 7 below. With `num_processes=2`, `batch_size: 32` is 16 per GPU.
 - **`training.debug=True` cannot be used with the robocasa task configs.** It force-sets
   `rollout_every = 1`. Use explicit overrides for a short run instead; see
   [ENVIRONMENT.md](ENVIRONMENT.md).
@@ -239,3 +311,9 @@ Worth recording so they are not "fixed" later:
   `mujoco.FatalError: Offscreen framebuffer is not complete, error 0x8cdd` — GL
   framebuffer allocation failing once 8 offscreen renderers share the GPU with the
   resident model (sampled peak 11862 MiB of 12282 MiB). Size `n_envs` to the card.
+- **A 2-day multi-GPU run** reached epoch 300 with task success climbing
+  0.00 → 0.02 → 0.14 → 0.20 → 0.30 at epochs 50/100/150/200/300, confirming the rollout,
+  checkpoint and wandb paths all work end to end under load. That run was on the
+  pre-fix-7 configuration (effective batch 384, half-length cosine).
+- **After fixes 7 and 8**, a short 2-GPU run gives one scheduler step per 6 global steps
+  (was 3), which is what `num_training_steps` assumes.

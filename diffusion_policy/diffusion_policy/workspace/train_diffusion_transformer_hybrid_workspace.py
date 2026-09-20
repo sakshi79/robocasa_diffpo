@@ -33,6 +33,7 @@ from accelerate import Accelerator
 from accelerate import DistributedDataParallelKwargs
 from accelerate.utils import broadcast_object_list
 from accelerate.utils import InitProcessGroupKwargs
+from accelerate.utils import DataLoaderConfiguration
 from datetime import timedelta
 import time
 
@@ -74,7 +75,18 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         timeout_handler = InitProcessGroupKwargs(timeout=timedelta(hours=3)) # have processes wait up to 3 hours for evals to finish
         cfg = copy.deepcopy(self.cfg)
         # set split_batches=True so that effective batch size stays the same regardless of num GPUs
-        accelerator = Accelerator(log_with='wandb', kwargs_handlers=[ddp_kwargs, timeout_handler], split_batches=True)
+        #
+        # NOTE: accelerate >=1.x silently ignores a bare `split_batches=True` kwarg here --
+        # it is superseded by DataLoaderConfiguration, and accelerator.split_batches just
+        # stays False with no warning. That broke two things at once: dataloader.batch_size
+        # became per-process instead of global (doubling the effective batch on 2 GPUs), and
+        # AcceleratedScheduler advanced the lr scheduler num_processes times per step() call,
+        # so the cosine finished in half the run and then wrapped back up toward peak.
+        accelerator = Accelerator(
+            log_with='wandb',
+            kwargs_handlers=[ddp_kwargs, timeout_handler],
+            dataloader_config=DataLoaderConfiguration(split_batches=True),
+        )
 
         if cfg.training.debug:
             cfg.logging.project = "debug"
@@ -165,7 +177,12 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
             num_training_steps=num_training_steps,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            #
+            # last_epoch counts *scheduler* steps, and the scheduler is stepped once per
+            # optimizer step (every gradient_accumulate_every batches) -- not once per
+            # global_step. Passing global_step directly is harmless on a fresh run, where
+            # it is -1, but puts a resumed run accum-times too far along the cosine.
+            last_epoch=(self.global_step // cfg.training.gradient_accumulate_every) - 1
         )
 
         # configure ema
